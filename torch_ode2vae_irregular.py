@@ -19,25 +19,72 @@ from multiprocessing import Process, freeze_support
 torch.multiprocessing.set_start_method('spawn', force="True")
 
 
+def obscure_func(X):
+    N, T, D = X.shape
+    mask = np.random.rand(N, T) < 0.1
+    lengths = np.minimum(np.random.poisson(T, size=N), T - 1)
+
+    ts = np.vstack([np.arange(T) for _ in range(N)])
+    ts[mask] = -1
+    for i in range(N):
+        ts[i, lengths[i]:] = -1
+
+    # keep all initial time points
+    ts[:, 0] = 0
+
+    # filter out masked timepoints
+    times = []
+    for i in range(N):
+        t = ts[i]
+        t = list(t[t > -1]) + [-1] * np.sum(t==-1)
+        times.append(t)
+
+    # filter out masked images and pad
+    trainX = []
+    for i in range(N):
+        t = np.array(times[i])
+        idx = (t >= 0)
+        x_ = X[i, idx]
+        if np.sum(t >= 0) > 0:
+            ones = -1 * np.ones((np.sum(t < 0), D))
+            x_ = np.vstack((x_, ones))
+        trainX.append(x_)
+
+    trainX = np.stack(trainX, 0)
+    times = np.stack(times, 0)
+    return trainX, times, lengths
+
+def default_func(X):
+    N, T, D = X.shape
+    ts = np.vstack([np.arange(T) for _ in range(N)])
+    lengths = np.array([T] * N)
+    return X, ts, lengths
+
 # prepare dataset
 class Dataset(data.Dataset):
-    def __init__(self, Xtr):
-        self.Xtr = Xtr # N,16,784
+    def __init__(self, Xtr, ts, lengths):
+        self.Xtr = Xtr           # N,16,784
+        self.ts = ts             # N,16
+        self.lengths = lengths   # N
     def __len__(self):
         return len(self.Xtr)
     def __getitem__(self, idx):
-        return self.Xtr[idx]
+        return self.Xtr[idx], self.ts[idx], self.lengths[idx]
+
 # read data
 X = loadmat('rot-mnist-3s.mat')['X'].squeeze() # (N, 16, 784)
 N = 500
 T = 16
-Xtr   = torch.tensor(X[:N],dtype=torch.float32).view([N,T,1,28,28])
-Xtest = torch.tensor(X[N:],dtype=torch.float32).view([-1,T,1,28,28])
+train_X, train_ts, train_lengths = obscure_func(X[:N])
+test_X, test_ts, test_lengths = obscure_func(X[:N])
+Xtr   = torch.tensor(train_X,dtype=torch.float32).view([N,T,1,28,28])
+Xtest = torch.tensor(test_X,dtype=torch.float32).view([-1,T,1,28,28])
 # Generators
 params = {'batch_size': 100, 'shuffle': True, 'num_workers': 4}
-trainset = Dataset(Xtr)
+trainset = Dataset(Xtr, torch.tensor(train_ts), torch.tensor(train_lengths))
 trainset = data.DataLoader(trainset, **params)
-testset  = Dataset(Xtest)
+testset  = Dataset(Xtest, torch.tensor(test_ts[-1]),
+                   torch.tensor(test_lengths[-1]))
 testset  = data.DataLoader(testset, **params)
 
 # utils
@@ -52,6 +99,92 @@ class UnFlatten(nn.Module):
     def forward(self, input):
         nc = input[0].numel()//(self.w**2)
         return input.view(input.size(0), nc, self.w, self.w)
+
+def mask(X, lengths):
+    for n, l in enumerate(lengths):
+        X[:, n, int(l):] = 0
+    return X
+
+
+def pad(x, T):
+    p = T - len(x)
+    shape = [p] + list(x.shape[1:])
+    padding = torch.zeros(shape, device=x.device)
+    res = torch.cat([x, padding], 0)
+    return res
+
+def get_time_indices_single(grid, query):
+    """ Retrieves times specified by query.
+
+    Parameters
+    ----------
+    grid : torch.Tensor
+        Equally spaced time points separated by dt.
+        Dimension T.
+    query : torch.Tensor
+        Irregular spaced time points being queried.
+        Dimension t.
+
+    Returns
+    -------
+    index : torch.Tensor
+        Locations on the time_grid where the query times are.
+
+    Notes
+    -----
+    There are a few assumptions being made here
+    1. Time is already normalized to begin at zero.
+    2. The query times are already in the grid,
+       and that dt spacing can completely resolve them.
+
+    This implementation came from here
+    https://discuss.pytorch.org/t/find-the-nearest-value-in-the-list/73772/3
+    """
+    norm_query = query.view(-1, 1)
+    comps = grid > norm_query
+    _, index = torch.min(comps, dim=-1)
+    return index + 1
+
+
+def get_time_indices_batch(grid, query):
+    B, _ = query.size()
+    res = []
+    for b in range(B):
+        idx = get_time_indices_single(grid, query[b])
+        res.append(idx)
+
+    return torch.stack(res)
+
+def dense_integrate(f, z0, ts, dt, method, ret_time_grid=False):
+    device = ts.device
+    input_tuple = isinstance(z0, tuple)
+    T = torch.max(ts)    # T
+    # dense integration grid
+    td = torch.arange(0, T, dt, dtype=torch.float32, device=device)
+    ts_idx = get_time_indices_batch(td, ts)
+    N_, T_ = ts.shape
+
+    zd = odeint(f, z0, td, method=method)  # T,N,n # dense sequence
+    if not input_tuple:
+        shape = list(zd.shape)
+        shape[0] = T_
+        z_ = torch.zeros(shape, device=device)
+        for b in range(N_):
+            idx = ts_idx[b]
+            z[:, b] = zd[idx, b]
+    else:
+        z = []
+        for zd_ in zd:
+            shape = list(zd_.shape)
+            shape[0] = T_
+            z_ = torch.zeros(shape, device=device)
+            for b in range(N_):
+                idx = ts_idx[b]
+                z_[:, b] = zd_[idx, b]
+            z.append(z_)
+    if ret_time_grid:
+        return z, zd, td
+    return z, zd
 
 
 # model implementation
@@ -112,7 +245,8 @@ class ODE2VAE(nn.Module):
         tr_ddvi_dvi = torch.sum(ddvi_dvi,1) # N
         return (dvs,-tr_ddvi_dvi)
 
-    def elbo(self, qz_m, qz_logv, zode_L, logpL, X, XrecL, Ndata, qz_enc_m=None, qz_enc_logv=None):
+    def elbo(self, qz_m, qz_logv, zode_L, logpL, X, XrecL, lengths,
+             Ndata, qz_enc_m=None, qz_enc_logv=None):
         ''' Input:
                 qz_m        - latent means [N,2q]
                 qz_logv     - latent logvars [N,2q]
@@ -120,6 +254,7 @@ class ODE2VAE(nn.Module):
                 logpL       - densities of latent trajectory samples [L,N,T]
                 X           - input images [N,T,nc,d,d]
                 XrecL       - reconstructions [L,N,T,nc,d,d]
+                lengths     - time series lengths [N]
                 Ndata       - number of sequences in the dataset (required for elbo
                 qz_enc_m    - encoder density means  [N*T,2*q]
                 qz_enc_logv - encoder density variances [N*T,2*q]
@@ -138,16 +273,20 @@ class ODE2VAE(nn.Module):
         kl_zt   = logpL - log_pzt  # L,N,T
         kl_z    = kl_zt.sum(2).mean(0) # N
         kl_w    = self.bnn.kl().sum()
+        eps = 1e-3
         # likelihood
         XL = X.repeat([L,1,1,1,1,1]) # L,N,T,nc,d,d
-        lhood_L = torch.log(1e-3+XrecL)*XL + torch.log(1e-3+1-XrecL)*(1-XL) # L,N,T,nc,d,d
+        lhood_L = torch.log(eps+XrecL)*XL + torch.log(eps+1-XrecL)*(1-XL) # L,N,T,nc,d,d
+        lhood_L = mask(lhood_L, lengths)
         lhood = lhood_L.sum([2,3,4,5]).mean(0) # N
         if qz_enc_m is not None: # instant encoding
             qz_enc_mL    = qz_enc_m.repeat([L,1])  # L*N*T,2*q
             qz_enc_logvL = qz_enc_logv.repeat([L,1])  # L*N*T,2*q
             mean_ = qz_enc_mL.contiguous().view(-1) # L*N*T*2*q
-            std_  = 1e-3+qz_enc_logvL.exp().contiguous().view(-1) # L*N*T*2*q
-            qenc_zt_ode = Normal(mean_,std_).log_prob(zode_L.contiguous().view(-1)).view([L,N,T,2*q])
+            std_  = eps+qz_enc_logvL.exp().contiguous().view(-1) # L*N*T*2*q
+            qenc_zt_ode = Normal(mean_,std_).log_prob(
+                zode_L.contiguous().view(-1)).view([L,N,T,2*q])
+            qenc_zt_ode = mask(qenc_zt_ode, lengths)
             qenc_zt_ode = qenc_zt_ode.sum([3]) # L,N,T
             inst_enc_KL = logpL - qenc_zt_ode
             inst_enc_KL = inst_enc_KL.sum(2).mean(0) # N
@@ -155,9 +294,11 @@ class ODE2VAE(nn.Module):
         else:
             return Ndata*lhood.mean(), Ndata*kl_z.mean(), kl_w
 
-    def forward(self, X, Ndata, L=1, inst_enc=False, method='dopri5', dt=0.1):
+    def forward(self, X, ts, lengths, Ndata, L=1, inst_enc=False, method='dopri5', dt=0.1):
         ''' Input
                 X          - input images [N,T,nc,d,d]
+                ts         - observed time points
+                lengths    - length of observed time series
                 Ndata      - number of sequences in the dataset (required for elbo)
                 L          - number of Monta Carlo draws (from BNN)
                 inst_enc   - whether instant encoding is used or not
@@ -182,14 +323,16 @@ class ODE2VAE(nn.Module):
         z0    = qz0_m + eps*torch.exp(qz0_logv) # N,2q
         logp0 = self.mvn.log_prob(eps) # N
         # ODE
-        t  = dt * torch.arange(T,dtype=torch.float).to(z0.device)
         ztL   = []
         logpL = []
         # sample L trajectories
         for l in range(L):
             f       = self.bnn.draw_f() # draw a differential function
             oderhs  = lambda t,vs: self.ode2vae_rhs(t,vs,f) # make the ODE forward function
-            zt,logp = odeint(oderhs,(z0,logp0),t,method=method) # T,N,2q & T,N
+            # zt,logp = odeint(oderhs,(z0,logp0),t,method=method) # T,N,2q & T,N
+            z, zd = dense_integrate(oderhs, (z0, logp0), ts, dt, method=method)
+            zt, logp = z
+            zt, logp = pad(zt, T), pad(logp, T)
             ztL.append(zt.permute([1,0,2]).unsqueeze(0)) # 1,N,T,2q
             logpL.append(logp.permute([1,0]).unsqueeze(0)) # 1,N,T
         ztL   = torch.cat(ztL,0) # L,N,T,2q
@@ -204,10 +347,12 @@ class ODE2VAE(nn.Module):
             h = self.encoder(X.contiguous().view([N*T,nc,d,d]))
             qz_enc_m, qz_enc_logv = self.fc1(h), self.fc2(h) # N*T,2q & N*T,2q
             lhood, kl_z, kl_w, inst_KL = \
-                self.elbo(qz0_m, qz0_logv, ztL, logpL, X, Xrec, Ndata, qz_enc_m, qz_enc_logv)
+                self.elbo(qz0_m, qz0_logv, ztL, logpL, X, Xrec, lengths,
+                          Ndata, qz_enc_m, qz_enc_logv)
             elbo = lhood - kl_z - inst_KL - self.beta*kl_w
         else:
-            lhood, kl_z, kl_w = self.elbo(qz0_m, qz0_logv, ztL, logpL, X, Xrec, Ndata)
+            lhood, kl_z, kl_w = self.elbo(qz0_m, qz0_logv, ztL, logpL, X, Xrec,
+                                          lengths, Ndata)
             elbo = lhood - kl_z - self.beta*kl_w
         return Xrec, qz0_m, qz0_logv, ztL, elbo, lhood, kl_z, self.beta*kl_w
 
@@ -265,8 +410,12 @@ if __name__ == '__main__':
     for ep in range(Nepoch):
         L = 1 if ep<Nepoch//2 else 5 # increasing L as optimization proceeds is a good practice
         for i,local_batch in enumerate(trainset):
-            minibatch = local_batch.to(device)
-            elbo, lhood, kl_z, kl_w = ode2vae(minibatch, len(trainset), L=L, inst_enc=True, method='rk4')[4:]
+            trainX, trainTS, trainL = local_batch
+            trainX  = trainX.to(device)
+            trainTS  = trainTS.to(device)
+            trainL  = trainL.to(device)
+            elbo, lhood, kl_z, kl_w = ode2vae(
+                trainX, trainTS, trainL, len(trainset), L=L, inst_enc=True, method='rk4')[4:]
             tr_loss = -elbo
             optimizer.zero_grad()
             tr_loss.backward()
@@ -275,7 +424,7 @@ if __name__ == '__main__':
                 format(i, lhood.item(), kl_z.item(), kl_w.item()))
         with torch.set_grad_enabled(False):
             for test_batch in testset:
-                test_batch = test_batch.to(device)
+                test_batch = test_batch[0].to(device)
                 Xrec_mu, test_mse = ode2vae.mean_rec(test_batch, method='rk4')
                 plot_rot_mnist(test_batch, Xrec_mu, False, fname='rot_mnist.png')
                 torch.save(ode2vae.state_dict(), 'ode2vae_mnist.pth')
