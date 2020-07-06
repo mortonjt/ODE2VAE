@@ -19,14 +19,79 @@ from multiprocessing import Process, freeze_support
 torch.multiprocessing.set_start_method('spawn', force="True")
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from torch.utils import data
+from torch.distributions import MultivariateNormal, Normal, kl_divergence as kl
+from torch_bnn import BNN
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+from torchdiffeq import odeint
+
+import numpy as np
+from scipy.io import loadmat
+import matplotlib.pyplot as plt
+plt.switch_backend('agg')
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
+
+from multiprocessing import Process, freeze_support
+torch.multiprocessing.set_start_method('spawn', force="True")
+
+
+def obscure_func(X):
+    N, T, D = X.shape
+    mask = np.random.rand(N, T) < 0.1
+    lengths = np.minimum(np.random.poisson(T, size=N), T - 1)
+
+    ts = np.vstack([np.arange(T) for _ in range(N)])
+    ts[mask] = -1
+    for i in range(N):
+        ts[i, lengths[i]:] = -1
+
+    # keep all initial time points
+    ts[:, 0] = 0
+
+    # filter out masked timepoints
+    times = []
+    for i in range(N):
+        t = ts[i]
+        t = list(t[t > -1]) + [-1] * np.sum(t==-1)
+        times.append(t)
+
+    # filter out masked images and pad
+    trainX = []
+    for i in range(N):
+        t = np.array(times[i])
+        idx = (t >= 0)
+        x_ = X[i, idx]
+        if np.sum(t >= 0) > 0:
+            ones = -1 * np.ones((np.sum(t < 0), D))
+            x_ = np.vstack((x_, ones))
+        trainX.append(x_)
+
+    trainX = np.stack(trainX, 0)
+    times = np.stack(times, 0)
+    return trainX, times, lengths
+
+def default_func(X):
+    N, T, D = X.shape
+    ts = np.vstack([np.arange(T) for _ in range(N)])
+    lengths = np.array([T] * N)
+    return X, ts, lengths
+
 # prepare dataset
 class Dataset(data.Dataset):
-    def __init__(self, Xtr):
-        self.Xtr = Xtr # N,16,784
+    def __init__(self, Xtr, ts, lengths):
+        self.Xtr = Xtr           # N,16,784
+        self.ts = ts             # N,16
+        self.lengths = lengths   # N
     def __len__(self):
         return len(self.Xtr)
     def __getitem__(self, idx):
-        return self.Xtr[idx]
+        return self.Xtr[idx], self.ts[idx], self.lengths[idx]
+
 # read data
 X = loadmat('rot-mnist-3s.mat')['X'].squeeze() # (N, 16, 784)
 N = 500
@@ -37,11 +102,12 @@ Xtr   = torch.tensor(train_X,dtype=torch.float32).view([N,T,1,28,28])
 Xtest = torch.tensor(test_X,dtype=torch.float32).view([-1,T,1,28,28])
 # Generators
 params = {'batch_size': 100, 'shuffle': True, 'num_workers': 4}
-trainset = Dataset(Xtr)
+trainset = Dataset(Xtr, torch.tensor(train_ts), torch.tensor(train_lengths))
 trainset = data.DataLoader(trainset, **params)
 testset  = Dataset(Xtest, torch.tensor(test_ts),
                    torch.tensor(test_lengths))
 testset  = data.DataLoader(testset, **params)
+
 
 # utils
 class Flatten(nn.Module):
