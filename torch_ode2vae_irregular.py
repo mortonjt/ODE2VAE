@@ -122,6 +122,74 @@ class UnFlatten(nn.Module):
         nc = input[0].numel()//(self.w**2)
         return input.view(input.size(0), nc, self.w, self.w)
 
+def get_time_indices_single(grid, query):
+    """ Retrieves times specified by query.
+    Parameters
+    ----------
+    grid : torch.Tensor
+        Equally spaced time points separated by dt.
+        Dimension T.
+    query : torch.Tensor
+        Irregular spaced time points being queried.
+        Dimension t.
+    Returns
+    -------
+    index : torch.Tensor
+        Locations on the time_grid where the query times are.
+    Notes
+    -----
+    There are a few assumptions being made here
+    1. Time is already normalized to begin at zero.
+    2. The query times are already in the grid,
+       and that dt spacing can completely resolve them.
+    This implementation came from here
+    https://discuss.pytorch.org/t/find-the-nearest-value-in-the-list/73772/3
+    """
+    norm_query = query.view(-1, 1)
+    comps = grid > norm_query
+    _, index = torch.min(comps, dim=-1)
+    return index + 1
+
+
+def get_time_indices_batch(grid, query):
+    B, _ = query.size()
+    res = []
+    for b in range(B):
+        idx = get_time_indices_single(grid, query[b])
+        res.append(idx)
+
+    return torch.stack(res)
+
+def dense_integrate(f, z0, ts, dt, method, ret_time_grid=False):
+    device = ts.device
+    input_tuple = isinstance(z0, tuple)
+    T = torch.max(ts)    # T
+    # dense integration grid
+    td = torch.arange(0, T, dt, dtype=torch.float32, device=device)
+    ts_idx = get_time_indices_batch(td, ts)
+    N_, T_ = ts.shape
+
+    zd = odeint(f, z0, td, method=method)  # T,N,n # dense sequence
+    if not input_tuple:
+        shape = list(zd.shape)
+        shape[0] = T_
+        z_ = torch.zeros(shape, device=device)
+        for b in range(N_):
+            idx = ts_idx[b]
+            z[:, b] = zd[idx, b]
+    else:
+        z = []
+        for zd_ in zd:
+            shape = list(zd_.shape)
+            shape[0] = T_
+            z_ = torch.zeros(shape, device=device)
+            for b in range(N_):
+                idx = ts_idx[b]
+                z_[:, b] = zd_[idx, b]
+            z.append(z_)
+    if ret_time_grid:
+        return z, zd, td
+    return z, zd
 
 # model implementation
 class ODE2VAE(nn.Module):
@@ -258,7 +326,7 @@ class ODE2VAE(nn.Module):
         for l in range(L):
             f       = self.bnn.draw_f() # draw a differential function
             oderhs  = lambda t,vs: self.ode2vae_rhs(t,vs,f) # make the ODE forward function
-            zt,logp = odeint(oderhs,(z0,logp0),t,method=method) # T,N,2q & T,N
+            zt,logp = dense_integrate(oderhs,(z0,logp0),t,method=method) # T,N,2q & T,N
             ztL.append(zt.permute([1,0,2]).unsqueeze(0)) # 1,N,T,2q
             logpL.append(logp.permute([1,0]).unsqueeze(0)) # 1,N,T
         ztL   = torch.cat(ztL,0) # L,N,T,2q
