@@ -76,15 +76,15 @@ X = loadmat('rot-mnist-3s.mat')['X'].squeeze() # (N, 16, 784)
 N = 500
 T = 16
 train_X, train_ts, train_lengths = obscure_func(X[:N])
-test_X, test_ts, test_lengths = obscure_func(X[:N])
+test_X, test_ts, test_lengths = default_func(X[N:])
 Xtr   = torch.tensor(train_X,dtype=torch.float32).view([N,T,1,28,28])
 Xtest = torch.tensor(test_X,dtype=torch.float32).view([-1,T,1,28,28])
 # Generators
 params = {'batch_size': 100, 'shuffle': True, 'num_workers': 4}
 trainset = Dataset(Xtr, torch.tensor(train_ts), torch.tensor(train_lengths))
 trainset = data.DataLoader(trainset, **params)
-testset  = Dataset(Xtest, torch.tensor(test_ts[-1]),
-                   torch.tensor(test_lengths[-1]))
+testset  = Dataset(Xtest, torch.tensor(test_ts),
+                   torch.tensor(test_lengths))
 testset  = data.DataLoader(testset, **params)
 
 # utils
@@ -426,7 +426,7 @@ if __name__ == '__main__':
             for test_batch in testset:
                 test_batch = test_batch[0].to(device)
                 Xrec_mu, test_mse = ode2vae.mean_rec(test_batch, method='rk4')
-                plot_rot_mnist(test_batch, Xrec_mu, False, fname='rot_mnist.png')
+                plot_rot_mnist(test_batch, Xrec_mu, False, fname='rot_mnist_irregular.png')
                 torch.save(ode2vae.state_dict(), 'ode2vae_mnist.pth')
                 break
         print('Epoch:{:4d}/{:4d} tr_elbo:{:8.2f}  test_mse:{:5.3f}\n'.format(ep, Nepoch, tr_loss.item(), test_mse.item()))
